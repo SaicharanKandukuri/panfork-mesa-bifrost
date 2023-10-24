@@ -1,0 +1,312 @@
+From c1b608a3f3c0980c7adbddebe174e8c8cec81ffa Mon Sep 17 00:00:00 2001
+From: Saikat Saha <ssaikatsaha1996@gmail.com>
+Date: Sat, 22 Apr 2023 05:24:43 +0000
+Subject: [PATCH] Mali-bifrost
+
+---
+ bin/install_megadrivers.py                    |  8 ++-
+ .../auxiliary/target-helpers/sw_helper.h      | 12 ++++
+ src/gallium/drivers/panfrost/pan_cmdstream.c  |  3 +-
+ src/gallium/drivers/panfrost/pan_public.h     |  4 ++
+ src/gallium/drivers/panfrost/pan_resource.c   | 16 ++++++
+ src/gallium/drivers/panfrost/pan_resource.h   |  3 +
+ src/gallium/drivers/panfrost/pan_screen.c     | 57 +++++++++++++++++++
+ src/gallium/drivers/panfrost/pan_screen.h     |  2 +
+ src/gallium/targets/dri/meson.build           | 17 ------
+ src/panfrost/base/pan_vX_base.c               |  3 +-
+ 10 files changed, 104 insertions(+), 21 deletions(-)
+
+diff --git a/bin/install_megadrivers.py b/bin/install_megadrivers.py
+index 60ee4576..d91ace68 100644
+--- a/bin/install_megadrivers.py
++++ b/bin/install_megadrivers.py
+@@ -23,7 +23,13 @@
+ """Script to install megadriver symlinks for meson."""
+ 
+ import argparse
+-import os
++import os, shutil
++def link(src, dest):
++    shutil.copyfile(src, dest)
++def unlink(src):
++    os.remove(src)
++os.link = link
++os.unlink = unlink
+ 
+ 
+ def main():
+diff --git a/src/gallium/auxiliary/target-helpers/sw_helper.h b/src/gallium/auxiliary/target-helpers/sw_helper.h
+index 12c09640..4276b469 100644
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -24,6 +24,10 @@
+ #include "asahi/agx_public.h"
+ #endif
+ 
++#ifdef GALLIUM_PANFROST
++#include "panfrost/pan_public.h"
++#endif
++
+ #ifdef GALLIUM_SOFTPIPE
+ #include "softpipe/sp_public.h"
+ #endif
+@@ -75,6 +79,11 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
+       screen = agx_screen_create(0, NULL, winsys);
+ #endif
+ 
++#if defined(GALLIUM_PANFROST)
++   if (screen == NULL && strcmp(driver, "panfrost") == 0)
++      screen = panfrost_create_screen_sw(winsys);
++#endif
++
+    return screen;
+ }
+ 
+@@ -90,6 +99,9 @@ sw_screen_create_vk(struct sw_winsys *winsys, const struct pipe_screen_config *c
+ #if defined(GALLIUM_ASAHI) && __APPLE__
+       (sw_vk || only_sw) ? "" : "asahi",
+ #endif
++#if defined(GALLIUM_PANFROST)
++      (sw_vk || only_sw) ? "" : "panfrost",
++#endif
+ #if defined(GALLIUM_LLVMPIPE)
+       "llvmpipe",
+ #endif
+diff --git a/src/gallium/drivers/panfrost/pan_cmdstream.c b/src/gallium/drivers/panfrost/pan_cmdstream.c
+index 227b6550..808220a1 100644
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -4208,8 +4208,9 @@ panfrost_direct_draw(struct panfrost_batch *batch,
+         if (idvs) {
+ #if PAN_ARCH >= 6
+                 tiler = pan_pool_alloc_desc(&batch->pool.base, INDEXED_VERTEX_JOB);
+-#endif
++#else
+                 unreachable("IDVS is unsupported on Midgard");
++#endif
+         } else {
+                 vertex = pan_pool_alloc_desc_cs_v10(&batch->pool.base, COMPUTE_JOB);
+                 tiler = pan_pool_alloc_desc_cs_v10(&batch->pool.base, TILER_JOB);
+diff --git a/src/gallium/drivers/panfrost/pan_public.h b/src/gallium/drivers/panfrost/pan_public.h
+index c7e72f94..bc35af1f 100644
+--- a/src/gallium/drivers/panfrost/pan_public.h
++++ b/src/gallium/drivers/panfrost/pan_public.h
+@@ -30,10 +30,14 @@ extern "C" {
+ 
+ struct pipe_screen;
+ struct renderonly;
++struct sw_winsys;
+ 
+ struct pipe_screen *
+ panfrost_create_screen(int fd, struct renderonly *ro);
+ 
++struct pipe_screen *
++panfrost_create_screen_sw(struct sw_winsys *winsys);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index c8127987..f8fca687 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -30,12 +30,14 @@
+  *
+  */
+ 
++#include <stdbool.h>
+ #include <xf86drm.h>
+ #include <fcntl.h>
+ #include "drm-uapi/drm_fourcc.h"
+ #include "drm-uapi/drm.h"
+ 
+ #include "frontend/winsys_handle.h"
++#include "frontend/sw_winsys.h"
+ #include "util/format/u_format.h"
+ #include "util/u_memory.h"
+ #include "util/u_surface.h"
+@@ -653,6 +655,20 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
+         so->base = *template;
+         so->base.screen = screen;
+ 
++        if (pan_screen(screen)->sw_winsys &&
++            (template->bind & PAN_BIND_SHARED_MASK)) {
++
++                so->dt = pan_screen(screen)->sw_winsys->displaytarget_create(
++                        pan_screen(screen)->sw_winsys,
++                        so->base.bind,
++                        so->base.format,
++                        so->base.width0,
++                        so->base.height0,
++                        64,
++                        NULL /*map_front_private*/,
++                        &so->dt_stride);
++        }
++
+         pipe_reference_init(&so->base.reference, 1);
+ 
+         util_range_init(&so->valid_buffer_range);
+diff --git a/src/gallium/drivers/panfrost/pan_resource.h b/src/gallium/drivers/panfrost/pan_resource.h
+index c5c14f5c..e9496042 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.h
++++ b/src/gallium/drivers/panfrost/pan_resource.h
+@@ -93,6 +93,9 @@ struct panfrost_resource {
+ 
+         /* Cached min/max values for index buffers */
+         struct panfrost_minmax_cache *index_cache;
++
++        struct sw_displaytarget *dt;
++        unsigned dt_stride;
+ };
+ 
+ static inline struct panfrost_resource *
+diff --git a/src/gallium/drivers/panfrost/pan_screen.c b/src/gallium/drivers/panfrost/pan_screen.c
+index ea315f8b..0dcf2881 100644
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -54,6 +54,9 @@
+ 
+ #include "pan_context.h"
+ 
++#include "pan_public.h"
++#include "frontend/sw_winsys.h"
++
+ static const struct debug_named_value panfrost_debug_options[] = {
+         {"perf",      PAN_DBG_PERF,     "Enable performance warnings"},
+         {"trace",     PAN_DBG_TRACE | PAN_DBG_BO_CLEAR, "Trace the command stream"},
+@@ -813,6 +816,43 @@ panfrost_get_driver_query_info(struct pipe_screen *pscreen, unsigned index,
+         return 1;
+ }
+ 
++static void
++panfrost_flush_frontbuffer(struct pipe_screen *_screen,
++                           struct pipe_context *pctx,
++                           struct pipe_resource *prsrc,
++                           unsigned level, unsigned layer,
++                           void *context_private, struct pipe_box *box)
++{
++        struct panfrost_resource *rsrc = pan_resource(prsrc);
++        struct panfrost_screen *screen = pan_screen(_screen);
++        struct sw_winsys *winsys = screen->sw_winsys;
++
++        assert(level == 0);
++
++        struct pipe_box my_box = {
++                .width = rsrc->base.width0,
++                .height = rsrc->base.height0,
++                .depth = 1,
++        };
++
++        assert(rsrc->dt);
++        uint8_t *map = winsys->displaytarget_map(winsys, rsrc->dt,
++                                                 PIPE_USAGE_DEFAULT);
++        assert(map);
++
++        struct pipe_transfer *trans = NULL;
++        uint8_t *tex_map = pctx->texture_map(pctx, prsrc, level,
++                                             PIPE_MAP_READ, &my_box, &trans);
++
++        for (unsigned row = 0; row < rsrc->base.height0; ++row)
++                memcpy(map + row * rsrc->dt_stride,
++                       tex_map + row * trans->stride,
++                       MIN2(rsrc->dt_stride, trans->stride));
++
++        pctx->texture_unmap(pctx, trans);
++
++        winsys->displaytarget_display(winsys, rsrc->dt, context_private, box);
++}
+ 
+ struct pipe_screen *
+ panfrost_create_screen(int fd, struct renderonly *ro)
+@@ -867,6 +907,7 @@ panfrost_create_screen(int fd, struct renderonly *ro)
+         screen->base.fence_finish = panfrost_fence_finish;
+         screen->base.fence_get_fd = panfrost_fence_get_fd;
+         screen->base.set_damage_region = panfrost_resource_set_damage_region;
++        screen->base.flush_frontbuffer = panfrost_flush_frontbuffer;
+ 
+         panfrost_resource_screen_init(&screen->base);
+         pan_blend_shaders_init(dev);
+@@ -897,3 +938,19 @@ panfrost_create_screen(int fd, struct renderonly *ro)
+ 
+         return &screen->base;
+ }
++
++struct pipe_screen *
++panfrost_create_screen_sw(struct sw_winsys *winsys)
++{
++        int fd = drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER);
++        if (fd < 0)
++                fd = open("/dev/mali0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
++        if (fd < 0)
++                return NULL;
++
++        struct pipe_screen *scr = panfrost_create_screen(fd, NULL);
++
++        if (scr)
++                pan_screen(scr)->sw_winsys = winsys;
++        return scr;
++}
+diff --git a/src/gallium/drivers/panfrost/pan_screen.h b/src/gallium/drivers/panfrost/pan_screen.h
+index 94cfcf47..2ca8da39 100644
+--- a/src/gallium/drivers/panfrost/pan_screen.h
++++ b/src/gallium/drivers/panfrost/pan_screen.h
+@@ -119,6 +119,8 @@ struct panfrost_screen {
+                 struct panfrost_pool bin_pool;
+         } indirect_draw;
+ 
++        struct sw_winsys *sw_winsys;
++
+         struct panfrost_vtable vtbl;
+         struct disk_cache *disk_cache;
+ };
+diff --git a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+index d0a9b91b..f21f10ee 100644
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -121,23 +121,6 @@ foreach d : [[with_gallium_kmsro, [
+   endif
+ endforeach
+ 
+-if meson.version().version_compare('>= 0.58')
+-  # This only works on Unix-like oses, which is probably fine for dri
+-  prog_ln = find_program('ln', required : false)
+-  if prog_ln.found()
+-    devenv.set('LIBGL_DRIVERS_PATH', meson.current_build_dir())
+-
+-    foreach d : gallium_dri_drivers
+-      custom_target(
+-        'devenv_@0@'.format(d),
+-        input : libgallium_dri,
+-        output : d,
+-        command : [prog_ln, '-f', '@INPUT@', '@OUTPUT@'],
+-        build_by_default : true,
+-      )
+-    endforeach
+-  endif
+-endif
+ 
+ meson.add_install_script(
+   install_megadrivers_py.path(),
+diff --git a/src/panfrost/base/pan_vX_base.c b/src/panfrost/base/pan_vX_base.c
+index 99bd356c..24e14b66 100644
+--- a/src/panfrost/base/pan_vX_base.c
++++ b/src/panfrost/base/pan_vX_base.c
+@@ -507,9 +507,9 @@ static struct kbase_op kbase_main[] = {
+ #endif
+ #if PAN_BASE_API >= 1
+         { init_mem_exec, NULL, "Initialise EXEC_VA zone" },
+-        { init_mem_jit, NULL, "Initialise JIT allocator" },
+ #endif
+ #if PAN_BASE_API >= 2
++        { init_mem_jit, NULL, "Initialise JIT allocator" },
+         { alloc_event_mem, free_event_mem, "Allocate event memory" },
+ #endif
+ };
+@@ -1817,7 +1817,6 @@ kbase_open_csf
+         for (unsigned i = 0; i < ARRAY_SIZE(kbase_main); ++i) {
+                 ++k->setup_state;
+                 if (!kbase_main[i].part(k)) {
+-                        k->close(k);
+                         return false;
+                 }
+         }
